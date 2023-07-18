@@ -5,18 +5,31 @@ import subprocess
 import numpy as np
 
 from PIL import Image
+import PIL
 from tqdm import tqdm
 from torch.utils.data import Dataset
 from easydict import EasyDict as edict
 from torchvision.datasets.utils import download_url
+import torch
+
 
 from .perturbations import TextShuffler
 from .constants import ARO_ROOT, COCO_ROOT, FLICKR_ROOT
 from .retrieval import pre_caption
 
+def diffusers_preprocess(image):
+    w, h = image.size
+    w, h = map(lambda x: x - x % 32, (w, h))  # resize to integer multiple of 32
+    image = image.resize((w, h), resample=PIL.Image.LANCZOS)
+    image = np.array(image).astype(np.float32) / 255.0
+    image = image[None].transpose(0, 3, 1, 2)
+    image = torch.from_numpy(image)
+    image = image.squeeze(0)
+    return 2.0 * image - 1.0
+
 
 class VG_Relation(Dataset):
-    def __init__(self, image_preprocess, text_perturb_fn=None, image_perturb_fn=None, root_dir=ARO_ROOT, download=False):
+    def __init__(self, image_preprocess, text_perturb_fn=None, image_perturb_fn=None, root_dir=ARO_ROOT, download=False, resize=512):
         '''
         image_preprocess: a function that takes in a PIL image and returns a tensor.
         text_perturb_fn: Not used for this dataset. Just for compatibility with other datasets.
@@ -46,6 +59,7 @@ class VG_Relation(Dataset):
             self.all_relations.append(item["relation_name"])
 
         self.image_preprocess = image_preprocess
+        self.resize = resize
 
     def __len__(self):
         return len(self.dataset)
@@ -55,15 +69,17 @@ class VG_Relation(Dataset):
         image = Image.open(test_case["image_path"]).convert('RGB')
         # Get the bounding box that contains the relation. This is to remove the irrelevant details in the scene.
         image = image.crop((test_case["bbox_x"], test_case["bbox_y"], test_case["bbox_x"] + test_case["bbox_w"], test_case["bbox_y"] + test_case["bbox_h"]))
-
-        if self.image_preprocess is not None:
-            image = self.image_preprocess(image)
+        if self.image_preprocess is None:
+            img0_resize = image.resize((self.resize, self.resize))
+            img0_resize = diffusers_preprocess(img0_resize)
+        else:
+            img0_resize = self.image_preprocess(image)
 
         # Each test case has a correct and incorrect caption.
         true_caption = test_case["true_caption"]
         false_caption = test_case["false_caption"]
         item = edict({"image_options": [image], "caption_options": [false_caption, true_caption]})
-        return item
+        return [0, [img0_resize]], [true_caption, false_caption], 0
     
     def download(self):
         os.makedirs(self.root_dir, exist_ok=True)
@@ -107,7 +123,7 @@ class VG_Relation(Dataset):
 
 
 class VG_Attribution(Dataset):
-    def __init__(self, image_preprocess, text_perturb_fn=None, image_perturb_fn=None, root_dir=ARO_ROOT, download=False):
+    def __init__(self, image_preprocess, text_perturb_fn=None, image_perturb_fn=None, root_dir=ARO_ROOT, download=False, resize=512):
         '''
         image_preprocess: a function that takes in a PIL image and returns a tensor.
         text_perturb_fn: Not used for this dataset. Just for compatibility with other datasets.
@@ -137,6 +153,7 @@ class VG_Attribution(Dataset):
         # Set of attributes in each test case
         self.all_attributes = [f"{item['attributes'][0]}_{item['attributes'][1]}" for item in self.dataset]
         self.image_preprocess = image_preprocess
+        self.resize = resize
 
     def __len__(self):
         return len(self.dataset)
@@ -146,15 +163,17 @@ class VG_Attribution(Dataset):
         image = Image.open(test_case["image_path"]).convert('RGB')
         # Get the bounding box that contains the relation. This is to remove the irrelevant details in the scene.
         image = image.crop((test_case["bbox_x"], test_case["bbox_y"], test_case["bbox_x"] + test_case["bbox_w"], test_case["bbox_y"] + test_case["bbox_h"]))
-
-        if self.image_preprocess is not None:
-            image = self.image_preprocess(image)
+        if self.image_preprocess is None:
+            img0_resize = image.resize((self.resize, self.resize))
+            img0_resize = diffusers_preprocess(img0_resize)
+        else:
+            img0_resize = self.image_preprocess(image)
 
         # Each test case has a correct and incorrect caption.
         true_caption = test_case["true_caption"]
         false_caption = test_case["false_caption"]
         item = edict({"image_options": [image], "caption_options": [false_caption, true_caption]})
-        return item
+        return [test_case['image_path'], [img0_resize]], [true_caption, false_caption], 0
     
     def download(self):
         os.makedirs(self.root_dir, exist_ok=True)
@@ -195,7 +214,7 @@ class VG_Attribution(Dataset):
 
 class COCO_Order(Dataset):
     def __init__(self, image_preprocess=None, root_dir=COCO_ROOT, max_words=30, split="test",
-                 image_perturb_fn=None, download=False):  
+                 image_perturb_fn=None, download=False, resize=512):  
         """
         COCO Order Dataset.
         image_preprocess: image preprocessing function
@@ -218,7 +237,7 @@ class COCO_Order(Dataset):
             else:
                 raise RuntimeError("Please either download the dataset by letting `--download` or specify the correct directory.")
         
-        urls = {'val':'https://storage.googleapis.com/sfr-vision-language-research/datasets/coco_karpathy_val.json',
+        urls = {'val':'image.png',
                 'test':'https://storage.googleapis.com/sfr-vision-language-research/datasets/coco_karpathy_test.json'}
         filenames = {'val':'coco_karpathy_val.json','test':'coco_karpathy_test.json'}
         download_url(urls[split],root_dir)
@@ -238,6 +257,7 @@ class COCO_Order(Dataset):
                 for perturb_fn in perturb_functions:
                     test_case["caption_options"].append(pre_caption(perturb_fn(caption), max_words))
                 self.test_cases.append(test_case)
+        self.resize = resize
                                     
     def __len__(self):
         return len(self.test_cases)
@@ -246,12 +266,15 @@ class COCO_Order(Dataset):
         test_case = self.test_cases[index]  
         image_path = os.path.join(self.image_root, test_case["image"])       
          
-        image = Image.open(image_path).convert('RGB')    
-        if self.image_preprocess is not None: 
-            image = self.image_preprocess(image)  
-        
+        image = Image.open(image_path).convert('RGB')
+        if self.image_preprocess is None:
+            img0_resize = image.resize((self.resize, self.resize))
+            img0_resize = diffusers_preprocess(img0_resize)
+        else:
+            img0_resize = self.image_preprocess(image)
+
         item = edict({"image_options": [image], "caption_options": test_case["caption_options"]})
-        return item
+        return [0, [img0_resize]], test_case["caption_options"], 0
     
     def download(self):
         import subprocess
@@ -282,7 +305,7 @@ class COCO_Order(Dataset):
 
 
 class Flickr30k_Order(Dataset):
-    def __init__(self, image_preprocess, split, root_dir=FLICKR_ROOT, max_words=30,
+    def __init__(self, image_preprocess, root_dir='datasets/flickr30k', split='val', max_words=30, resize=512,
                  *args, **kwargs):  
         """
         image_preprocess: image preprocessing function
@@ -290,6 +313,7 @@ class Flickr30k_Order(Dataset):
         root_dir: The directory of the flickr30k images. This should contain the `flickr30k-images` directory that \
             contains all the images. 
         """
+        root_dir = 'datasets/flickr30k'
         urls = {'val':'https://storage.googleapis.com/sfr-vision-language-research/datasets/flickr30k_val.json',
                 'test':'https://storage.googleapis.com/sfr-vision-language-research/datasets/flickr30k_test.json'}
         filenames = {'val':'flickr30k_val.json','test':'flickr30k_test.json'}
@@ -318,20 +342,24 @@ class Flickr30k_Order(Dataset):
                 for perturb_fn in perturb_functions:
                     test_case["caption_options"].append(pre_caption(perturb_fn(caption), max_words))
                 self.test_cases.append(test_case)
+        self.resize = resize
                                 
     def __len__(self):
         return len(self.test_cases)
     
     def __getitem__(self, index):  
         test_case = self.test_cases[index]  
-        image_path = os.path.join(self.root_dir, test_case["image"])        
-        image = Image.open(image_path).convert('RGB')    
+        image_path = os.path.join(self.root_dir, test_case["image"])   
+        image_path = image_path.replace('flickr30k-images', 'images')     
+        image = Image.open(image_path).convert('RGB')  
+        if self.image_preprocess is None:
+            img0_resize = image.resize((self.resize, self.resize))
+            img0_resize = diffusers_preprocess(img0_resize)  
+        else:
+            img0_resize = self.image_preprocess(image)
         
-        if self.image_preprocess is not None: 
-            image = self.image_preprocess(image)  
-            
         item = edict({"image_options": [image], "caption_options": test_case["caption_options"]})
-        return item
+        return [image_path, [img0_resize]], test_case["caption_options"], 0
     
     def evaluate_scores(self, scores):
         if isinstance(scores, tuple):
